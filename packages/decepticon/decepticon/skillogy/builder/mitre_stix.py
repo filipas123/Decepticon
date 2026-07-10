@@ -3,10 +3,11 @@
 Phase 1a only loads Enterprise v19.1. The importer accepts a local
 STIX 2.1 bundle (e.g. the pinned
 ``enterprise-attack-19.1.json`` from
-github.com/mitre-attack/attack-stix-data) and emits ``:Tactic`` +
-``:Technique`` nodes plus the MITRE hierarchy edges
+github.com/mitre-attack/attack-stix-data) and emits ``:Tactic``,
+``:Technique``, and ``:ThreatActor`` nodes plus MITRE edges
 (``HAS_TECHNIQUE`` from each Tactic to its Techniques and
-``HAS_SUBTECHNIQUE`` from a Technique to its Sub-Techniques).
+``HAS_SUBTECHNIQUE`` from a Technique to its Sub-Techniques, plus
+``USES_TECHNIQUE`` from ThreatActors to Techniques).
 
 Hazards handled
 ---------------
@@ -38,7 +39,7 @@ _ATTCK_VERSION = "19.1"
 
 
 def _attck_id(obj: dict[str, Any]) -> str | None:
-    """Return the ATT&CK external ID (TA0xxx / T1xxx[.xxx]) for an SDO."""
+    """Return the ATT&CK external ID (TA0xxx / T1xxx[.xxx] / Gxxxx) for an SDO."""
     for ref in obj.get("external_references") or []:
         if ref.get("source_name") == "mitre-attack":
             ext_id = ref.get("external_id")
@@ -49,6 +50,14 @@ def _attck_id(obj: dict[str, Any]) -> str | None:
 
 def _is_alive(obj: dict[str, Any]) -> bool:
     return not (obj.get("revoked") or obj.get("x_mitre_deprecated"))
+
+
+def _group_status(obj: dict[str, Any]) -> str:
+    if obj.get("revoked"):
+        return "revoked"
+    if obj.get("x_mitre_deprecated"):
+        return "deprecated"
+    return "active"
 
 
 def emit_mitre_records(bundle_path: Path) -> tuple[list[Node], list[Edge]]:
@@ -64,8 +73,10 @@ def emit_mitre_records(bundle_path: Path) -> tuple[list[Node], list[Edge]]:
     uuid_to_attck: dict[str, str] = {}
     # ATT&CK id → STIX object, used to look up name/description.
     technique_by_id: dict[str, dict[str, Any]] = {}
+    group_by_id: dict[str, dict[str, Any]] = {}
     tactic_by_shortname: dict[str, dict[str, Any]] = {}
     relationships: list[dict[str, Any]] = []
+    uses_relationships: list[dict[str, Any]] = []
 
     for obj in objects:
         if not isinstance(obj, dict):
@@ -84,9 +95,18 @@ def emit_mitre_records(bundle_path: Path) -> tuple[list[Node], list[Edge]]:
                 continue
             technique_by_id[attck_id] = obj
             uuid_to_attck[obj.get("id", "")] = attck_id
+        elif otype == "intrusion-set":
+            attck_id = _attck_id(obj)
+            if not attck_id:
+                continue
+            group_by_id[attck_id] = obj
+            uuid_to_attck[str(obj.get("id") or "")] = attck_id
         elif otype == "relationship":
-            if obj.get("relationship_type") == "subtechnique-of":
+            relationship_type = obj.get("relationship_type")
+            if relationship_type == "subtechnique-of":
                 relationships.append(obj)
+            elif relationship_type == "uses" and _is_alive(obj):
+                uses_relationships.append(obj)
 
     nodes: list[Node] = []
     edges: list[Edge] = []
@@ -174,6 +194,55 @@ def emit_mitre_records(bundle_path: Path) -> tuple[list[Node], list[Edge]]:
                 to_label="Technique",
                 to_key_field="id",
                 to_key=sub_id,
+            )
+        )
+
+    for rel in uses_relationships:
+        source_ref = rel.get("source_ref")
+        target_ref = rel.get("target_ref")
+        if not isinstance(source_ref, str) or not source_ref:
+            continue
+        if not isinstance(target_ref, str) or not target_ref:
+            continue
+        group_id = uuid_to_attck.get(source_ref)
+        technique_id = uuid_to_attck.get(target_ref)
+        if group_id not in group_by_id or technique_id not in technique_by_id:
+            continue
+        edges.append(
+            Edge(
+                edge_type="USES_TECHNIQUE",
+                from_label="ThreatActor",
+                from_key_field="id",
+                from_key=group_id,
+                to_label="Technique",
+                to_key_field="id",
+                to_key=technique_id,
+            )
+        )
+
+    for attck_id, group in sorted(group_by_id.items()):
+        aliases = sorted(
+            {alias for alias in group.get("aliases") or [] if isinstance(alias, str) and alias}
+        )
+        nodes.append(
+            Node(
+                label="ThreatActor",
+                key_field="id",
+                properties={
+                    "id": attck_id,
+                    "stix_id": str(group.get("id") or ""),
+                    "name": str(group.get("name") or ""),
+                    "description": str(group.get("description") or ""),
+                    "mitre_aliases": aliases,
+                    "status": _group_status(group),
+                    "created": str(group.get("created") or ""),
+                    "modified": str(group.get("modified") or ""),
+                    "matrix": "enterprise",
+                    "framework": "attack",
+                    "attck_version": _ATTCK_VERSION,
+                    "deprecated": bool(group.get("x_mitre_deprecated", False)),
+                    "revoked": bool(group.get("revoked", False)),
+                },
             )
         )
 
